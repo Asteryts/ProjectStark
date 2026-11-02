@@ -1,0 +1,9 @@
+# Entorno virtual (se reinstala con requirements.txt)
+.venv/
+
+# Archivos generados por Python
+__pycache__/
+*.pyc
+
+# Capturas de pantalla hechas con el gesto pulgar + meñique
+capturas/
