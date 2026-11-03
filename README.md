@@ -13,6 +13,7 @@ Controla tu computador con gestos de la mano usando la cámara. Hecho en Python 
 | 🤏 Pellizco mantenido | Arrastrar |
 | 🖐️ Mano abierta quieta (1 s) | Play / Pausa |
 | 🖐️ Mano abierta deslizando | Pestaña siguiente / anterior |
+| 🖖 Cuatro dedos (pulgar escondido) deslizando | Cambiar de aplicación (Alt+Tab); baja la mano para elegirla |
 | ✌️ Paz | Siguiente canción |
 | 🤟 Tres dedos (índice, medio, anular) | Scroll |
 | 👍 Pulgar arriba | Subir volumen |

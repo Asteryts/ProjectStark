@@ -7,6 +7,8 @@ Gestos (con las acciones ACTIVADAS):
   - Juntar pulgar e índice (mantener)  -> arrastrar (mantiene el clic hasta separar los dedos)
   - Mano abierta quieta (1 segundo)    -> Play / Pausa de música
   - Mano abierta deslizando a un lado  -> pestaña siguiente / anterior
+  - Cuatro dedos (pulgar escondido)
+    deslizando a un lado               -> cambiar de aplicación (Alt+Tab); baja la mano para elegirla
   - Signo de paz (índice + medio)      -> siguiente canción
   - Tres dedos (índice, medio, anular) -> scroll (sube o baja la mano)
   - Pulgar arriba                      -> subir volumen (se repite mientras lo mantienes)
@@ -38,8 +40,14 @@ CARPETA_CAPTURAS = CARPETA / "capturas"
 # Ajustes generales
 TIEMPO_CONFIRMAR = 0.3       # segundos que debe mantenerse un gesto antes de actuar
 ESPERA_ENTRE_ACCIONES = 1.0  # segundos mínimos entre dos acciones del mismo gesto
-SUAVIZADO = 0.25             # 0..1, más bajo = cursor más suave pero más lento
 MARGEN = 0.15                # zona del borde de la cámara que no se usa para el cursor
+
+# Cursor: el suavizado cambia según la velocidad (lento = preciso, rápido = ágil)
+SUAVIZADO_MIN = 0.10         # para movimientos pequeños (más bajo = más preciso)
+SUAVIZADO_MAX = 0.5          # para movimientos grandes (más alto = más rápido)
+DISTANCIA_RAPIDA = 700       # píxeles a partir de los cuales el cursor va a máxima velocidad
+ZONA_MUERTA_CURSOR = 1.5     # píxeles; movimientos menores se ignoran (quita el temblor)
+RETROCESO_CLIC = 0.25        # el clic se hace donde estaba el cursor este tiempo ANTES del pellizco
 
 # Pellizco (clic y arrastrar)
 UMBRAL_PELLIZCO = 0.35       # distancia pulgar-índice para EMPEZAR el pellizco (relativa a la mano)
@@ -55,6 +63,8 @@ ESPERA_DESLIZAR = 0.7        # segundos mínimos entre dos deslizamientos
 TIEMPO_QUIETO = 1.0          # mano abierta quieta este tiempo -> play/pausa
 MOVIMIENTO_QUIETO = 0.04     # cuánto puede moverse la mano y seguir "quieta"
 BLOQUEO_TRAS_DESLIZAR = 1.5  # después de deslizar, no hay play/pausa durante este tiempo
+BLOQUEO_CONTRARIO = 1.0      # tras deslizar, se ignora el movimiento de vuelta en sentido contrario
+SOLTAR_ALT = 0.8             # segundos sin mano abierta para elegir la aplicación (suelta Alt)
 TECLAS_DESLIZAR_DERECHA = ("ctrl", "tab")
 TECLAS_DESLIZAR_IZQUIERDA = ("ctrl", "shift", "tab")
 
@@ -122,6 +132,8 @@ def detectar_gesto(lm, ya_pellizcando=False):
         return "puno"
     if all([pulgar, indice, medio, anular, menique]):
         return "mano_abierta"
+    if indice and medio and anular and menique:
+        return "cuatro_dedos"
     if indice and medio and anular and not menique:
         return "tres_dedos"
     if indice and medio and not anular and not menique:
@@ -177,15 +189,42 @@ def main():
 
     ancho_pantalla, alto_pantalla = pyautogui.size()
     cursor = list(pyautogui.position())
+    historial_cursor = deque()      # (tiempo, x, y) del cursor, para clicar donde apuntabas
 
-    def mover_cursor(px, py):
+    def a_pantalla(px, py):
+        """Convierte una posición de la cámara (0..1) en píxeles de la pantalla."""
         x = (px - MARGEN) / (1 - 2 * MARGEN)
         y = (py - MARGEN) / (1 - 2 * MARGEN)
-        x = min(max(x, 0), 1) * (ancho_pantalla - 3) + 1
-        y = min(max(y, 0), 1) * (alto_pantalla - 3) + 1
-        cursor[0] += (x - cursor[0]) * SUAVIZADO
-        cursor[1] += (y - cursor[1]) * SUAVIZADO
+        return (min(max(x, 0), 1) * (ancho_pantalla - 3) + 1,
+                min(max(y, 0), 1) * (alto_pantalla - 3) + 1)
+
+    def mover_cursor(x, y):
+        # Los movimientos pequeños se frenan mucho (precisión) y los grandes casi nada (rapidez)
+        dx, dy = x - cursor[0], y - cursor[1]
+        dist = math.hypot(dx, dy)
+        if dist < ZONA_MUERTA_CURSOR:
+            return
+        factor = min(SUAVIZADO_MAX, SUAVIZADO_MIN + dist / DISTANCIA_RAPIDA)
+        cursor[0] += dx * factor
+        cursor[1] += dy * factor
         pyautogui.moveTo(cursor[0], cursor[1])
+        ahora = time.monotonic()
+        historial_cursor.append((ahora, cursor[0], cursor[1]))
+        while ahora - historial_cursor[0][0] > 1.0:
+            historial_cursor.popleft()
+
+    def posicion_antes_de(momento):
+        """Dónde estaba el cursor en ese momento.
+
+        Al pellizcar, el índice baja hacia el pulgar y arrastra el cursor un poco;
+        por eso el clic se hace donde apuntabas justo antes de empezar el pellizco.
+        """
+        posicion = tuple(cursor)
+        for t, x, y in reversed(historial_cursor):
+            posicion = (x, y)
+            if t <= momento:
+                break
+        return posicion
 
     activo = False
     gesto_actual, inicio_gesto, disparado = None, 0.0, False
@@ -193,8 +232,10 @@ def main():
     ultima_repeticion = 0.0
     historial_mano = deque()        # (tiempo, x, y de la muñeca) con la mano abierta
     ultima_mano_abierta, ultimo_deslizar = -10.0, -10.0
+    tipo_deslizar, ultima_direccion, alt_presionado = None, 0, False
     y_scroll_anterior = None
     inicio_pellizco, ultimo_pellizco, arrastrando = None, 0.0, False
+    punto_clic, desfase_arrastre = None, (0.0, 0.0)
     texto_accion, hora_texto = "", 0.0
 
     def mostrar(texto):
@@ -225,8 +266,9 @@ def main():
 
             # Al mover la mano rápido los dedos se ven borrosos y el gesto puede
             # cambiar un instante; por eso la mano abierta se sigue 0.3 s más.
-            if gesto == "mano_abierta":
+            if gesto in ("mano_abierta", "cuatro_dedos"):
                 ultima_mano_abierta = ahora
+                tipo_deslizar = gesto
             siguiendo_mano = lm is not None and ahora - ultima_mano_abierta < 0.3
             if siguiendo_mano:
                 historial_mano.append((ahora, lm[0].x, lm[0].y))
@@ -240,44 +282,69 @@ def main():
                 ultimo_pellizco = ahora
                 if inicio_pellizco is None:
                     inicio_pellizco = ahora
+                    punto_clic = posicion_antes_de(ahora - RETROCESO_CLIC)
+                medio_x, medio_y = a_pantalla((lm[4].x + lm[8].x) / 2, (lm[4].y + lm[8].y) / 2)
                 if activo and not arrastrando and ahora - inicio_pellizco > TIEMPO_ARRASTRE:
+                    cursor[:] = punto_clic
+                    pyautogui.moveTo(*punto_clic)
                     pyautogui.mouseDown()
                     arrastrando = True
+                    # El arrastre sigue a los dedos desde donde estaba el cursor, sin saltos
+                    desfase_arrastre = (punto_clic[0] - medio_x, punto_clic[1] - medio_y)
                     mostrar("Arrastrando")
-                if arrastrando:
-                    mover_cursor((lm[4].x + lm[8].x) / 2, (lm[4].y + lm[8].y) / 2)
+                elif arrastrando:
+                    mover_cursor(medio_x + desfase_arrastre[0], medio_y + desfase_arrastre[1])
             elif inicio_pellizco is not None and ahora - ultimo_pellizco > TOLERANCIA_PELLIZCO:
                 if arrastrando:
                     pyautogui.mouseUp()
                     arrastrando = False
                     mostrar("Soltar")
                 elif activo and ultimo_pellizco - inicio_pellizco >= TIEMPO_MIN_CLIC:
-                    pyautogui.click()
+                    cursor[:] = punto_clic
+                    pyautogui.click(*punto_clic)
                     mostrar("Clic")
                 inicio_pellizco = None
 
             if activo and inicio_pellizco is None:
-                # --- Mano abierta deslizando: cambiar de pestaña ---
+                # --- Deslizar: mano abierta = pestañas, cuatro dedos = aplicaciones ---
                 if siguiendo_mano and ahora - ultimo_deslizar > ESPERA_DESLIZAR:
                     xs = [x for t, x, _ in historial_mano if ahora - t <= VENTANA_DESLIZAR]
                     recorrido = xs[-1] - xs[0]
-                    if abs(recorrido) > DISTANCIA_DESLIZAR:
-                        if recorrido > 0:
+                    direccion = 1 if recorrido > 0 else -1
+                    # Al volver la mano a su sitio después de deslizar no debe contar al revés
+                    es_vuelta = (direccion != ultima_direccion
+                                 and ahora - ultimo_deslizar < BLOQUEO_CONTRARIO)
+                    if abs(recorrido) > DISTANCIA_DESLIZAR and es_vuelta:
+                        historial_mano.clear()  # descartar ese movimiento para que no cuente luego
+                    elif abs(recorrido) > DISTANCIA_DESLIZAR:
+                        if alt_presionado or tipo_deslizar == "cuatro_dedos":
+                            # Alt se mantiene apretado para ver el selector de ventanas;
+                            # se suelta (y elige la app) al bajar la mano
+                            if not alt_presionado:
+                                pyautogui.keyDown("alt")
+                                alt_presionado = True
+                            if direccion > 0:
+                                pyautogui.press("tab")
+                                mostrar("Aplicacion siguiente >>")
+                            else:
+                                pyautogui.hotkey("shift", "tab")
+                                mostrar("<< Aplicacion anterior")
+                        elif direccion > 0:
                             pyautogui.hotkey(*TECLAS_DESLIZAR_DERECHA)
                             mostrar("Pestana siguiente >>")
                         else:
                             pyautogui.hotkey(*TECLAS_DESLIZAR_IZQUIERDA)
                             mostrar("<< Pestana anterior")
-                        ultimo_deslizar = ahora
+                        ultimo_deslizar, ultima_direccion = ahora, direccion
                         historial_mano.clear()
                         disparado = True
 
                 # --- Índice: mover el cursor (sin esperar, para que sea fluido) ---
                 if gesto == "indice" and not siguiendo_mano:
-                    mover_cursor(lm[8].x, lm[8].y)
+                    mover_cursor(*a_pantalla(lm[8].x, lm[8].y))
 
                 # --- Mano abierta quieta: play/pausa ---
-                elif gesto == "mano_abierta":
+                elif gesto == "mano_abierta" and not alt_presionado:
                     quieta = [(x, y) for t, x, y in historial_mano if ahora - t <= TIEMPO_QUIETO]
                     if (quieta and not disparado and duracion > TIEMPO_QUIETO
                             and ahora - ultimo_deslizar > BLOQUEO_TRAS_DESLIZAR
@@ -314,6 +381,12 @@ def main():
                     ultima_accion[gesto] = ahora
                     disparado = True
 
+            # Bajar la mano (o pausar) después de cambiar de app: soltar Alt para elegirla
+            if alt_presionado and (not activo or ahora - ultima_mano_abierta > SOLTAR_ALT):
+                pyautogui.keyUp("alt")
+                alt_presionado = False
+                mostrar("Aplicacion elegida")
+
             # --- Interfaz ---
             estado = "ACTIVO" if activo else "PAUSADO (ESPACIO para activar)"
             color = (0, 200, 0) if activo else (0, 0, 255)
@@ -336,6 +409,8 @@ def main():
 
     if arrastrando:
         pyautogui.mouseUp()
+    if alt_presionado:
+        pyautogui.keyUp("alt")
     cam.release()
     cv2.destroyAllWindows()
 
